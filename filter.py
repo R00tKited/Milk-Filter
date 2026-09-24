@@ -1,349 +1,429 @@
-import threading
-import os
+#!/usr/bin/env python3
+"""Milk filter: turn any image into something you would find in Milk inside/outside a bag of milk.
+
+Run it without arguments to open the GUI, or with arguments to use it from the command line:
+    python filter.py -f image.png -a -p -c 30 -o saved.png
+"""
+import argparse
 import io
-import sys
+import os
+import queue
 import random
-from PIL import Image, ImageTk
-import tkinter as tk
-from tkinter import ttk
-from tkinter import filedialog as fd
+import sys
+import threading
+
+from PIL import Image, ImageMath, ImageOps
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog as fd
+    from tkinter import messagebox, ttk
+
+    from PIL import ImageTk
+except ImportError:  # Tk is only needed for the GUI, the command line works without it
+    tk = None
 
 
+# Colors of each game: black, dark shade and bright shade.
+PALETTES = {
+    1: [(0, 0, 0), (102, 0, 31), (137, 0, 146)],
+    2: [(0, 0, 0), (92, 36, 60), (203, 43, 43)],
+}
+# Brightness where the dark shade stops mixing with black, and where the bright shade starts.
+MID_THRESHOLDS = {1: (120, 200), 2: (90, 150)}
+# With the pointillism effect, a pixel keeps its color with this chance and takes the neighbouring one otherwise.
+POINTILLISM_CHANCE = 0.7
 
-#Function for pyinstaller to correctly use the .ico file
-def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
+
+def _color_tables(milk_type):
+    """Palette index for every possible R+G+B sum (0..765).
+
+    Returns two tables: the color a pixel normally gets, and the one it gets when the
+    pointillism effect swaps it (they only differ in the mixed brightness ranges).
+    """
+    mid1, mid2 = MID_THRESHOLDS[milk_type]
+    usual, swapped = [], []
+    for total in range(766):
+        brightness = total / 3
+        if brightness <= 25:
+            pair = (0, 0)
+        elif brightness <= 70:
+            pair = (0, 1)
+        elif brightness < mid1:
+            pair = (1, 0)
+        elif brightness < mid2:
+            pair = (1, 1)
+        elif brightness < 230:
+            pair = (2, 1)
+        else:
+            pair = (2, 2)
+        usual.append(pair[0])
+        swapped.append(pair[1])
+    return usual, swapped
+
+
+def _band_sum(img):
+    """R+G+B of every pixel of an RGB image, as a 32-bit integer image."""
+    r, g, b = img.split()
+    if hasattr(ImageMath, "lambda_eval"):  # Pillow >= 10.3
+        return ImageMath.lambda_eval(lambda args: args["r"] + args["g"] + args["b"], r=r, g=g, b=b)
+    return ImageMath.eval("r + g + b", r=r, g=g, b=b)
+
+
+def _to_indices(total, table):
+    """Turn the R+G+B image into palette indices with a lookup table."""
+    return total.point(table + [0] * (65536 - len(table)), "L")
+
+
+def _alpha(img):
+    """Transparency of img, or None when it is fully opaque."""
+    if img.mode not in ("RGBA", "LA", "PA") and "transparency" not in img.info:
+        return None
+    alpha = img.convert("RGBA").getchannel("A")
+    return None if alpha.getextrema() == (255, 255) else alpha
+
+
+def upright(img):
+    """Copy of img turned the right way up: phones save photos rotated, with the rotation in the EXIF data."""
     try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
+        return ImageOps.exif_transpose(img)
+    except Exception:  # broken EXIF data, keep the image as it is stored
+        return img.copy()
 
+
+def apply_milk_filter(img, milk_type=1, pointillism=False, compression=0, seed=None):
+    """Return a copy of img in the colors of Milk1 (milk_type=1) or Milk2 (milk_type=2).
+
+    compression (0-100) lowers the JPEG quality first for a more pixelated look,
+    seed makes the pointillism effect repeatable. Transparency of img is kept.
+    """
+    img = upright(img)
+    alpha = _alpha(img)
+    img = img.convert("RGB")
+
+    if compression > 0:
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=max(1, 100 - compression))
+        buffer.seek(0)
+        img = Image.open(buffer).convert("RGB")
+
+    # Each pixel gets one of the three colors depending on its brightness, (R+G+B)/3.
+    # The sum R+G+B carries the same information in whole numbers, so lookup tables can do the work.
+    total = _band_sum(img)
+    usual, swapped = _color_tables(milk_type)
+    indices = _to_indices(total, usual)
+    if pointillism:
+        noise = Image.frombytes("L", img.size, random.Random(seed).randbytes(img.width * img.height))
+        limit = round(POINTILLISM_CHANCE * 256)
+        keep = noise.point(lambda value: 255 if value < limit else 0)
+        indices = Image.composite(indices, _to_indices(total, swapped), keep)
+
+    indices.putpalette([channel for color in PALETTES[milk_type] for channel in color])
+    result = indices.convert("RGB")
+    if alpha is not None:
+        result.putalpha(alpha)
+    return result
+
+
+def save_image(img, path):
+    """Save img in the format given by the file extension (.png, .jpg, ...)."""
+    extension = os.path.splitext(path)[1].lower()
+    Image.init()  # load every format plugin, older Pillow doesn't do it in registered_extensions()
+    image_format = Image.registered_extensions().get(extension)
+    if image_format not in Image.SAVE:
+        raise ValueError(f"Can't save images as {extension or 'a file without extension'}, use .png or .jpg")
+    if image_format == "JPEG" and img.mode == "RGBA":
+        img = img.convert("RGB")  # JPEG can't store transparency
+    img.save(path, format=image_format)
+
+
+def run_cli(argv):
+    parser = argparse.ArgumentParser(description="Milk image filter. Run without arguments to open the GUI.")
+    parser.add_argument("-f", "--file", help="Specify input image.", required=True)
+    parser.add_argument("-o", "--out", help="Specify out path.", required=True)
+    parser.add_argument("-a", "--alt", help="Alternative Milk effect (the effect from the second game).",
+                        action="store_true")
+    parser.add_argument("-p", "--pointism", help="Pointillism effect.", action="store_true")
+    parser.add_argument("-c", "--comp", help="Compression. from 0 to 100. Defaults to 0.", default=0, type=int)
+    args = parser.parse_args(argv)
+
+    try:
+        with Image.open(args.file) as img:
+            result = apply_milk_filter(img, milk_type=2 if args.alt else 1, pointillism=args.pointism,
+                                       compression=args.comp)
+        save_image(result, args.out)
+    except (OSError, ValueError) as error:
+        sys.exit(f"Error: {error}")
+
+
+def resource_path(relative_path):
+    """Absolute path to a file next to this script, or inside the EXE made with PyInstaller."""
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, relative_path)
 
-window = tk.Tk()
-window.title("Milk filter!")
-widthWindow= window.winfo_screenwidth()               
-heightWindow= window.winfo_screenheight()               
-window.geometry("%dx%d" % (widthWindow, heightWindow))
 
-# state zoomed doesnt work on x11 system
-if os.name == 'nt':
-    window.state('zoomed')
-else: 
-    window.state('normal')
-
-iconPath = resource_path("icon.ico")
-
-iconPhoto = ImageTk.PhotoImage(file = iconPath)
-window.iconphoto(False, iconPhoto)
+def fit(img, size):
+    """Scale img to fit in size, keeping its proportions."""
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA")
+    return ImageOps.contain(img, size, Image.Resampling.LANCZOS)
 
 
-#Add scrollbar vertically
-main_frame = tk.Frame(window)
-
-main_frame.pack(fill=tk.BOTH,expand=1)
-
-my_canvas = tk.Canvas(main_frame)
-my_canvas.pack(side=tk.LEFT,fill=tk.BOTH,expand=1)
-
-my_scrollbar = ttk.Scrollbar(main_frame,orient=tk.VERTICAL,command=my_canvas.yview)
-my_scrollbar.pack(side=tk.RIGHT,fill=tk.Y)
-
-my_canvas.configure(yscrollcommand=my_scrollbar.set)
-my_canvas.bind('<Configure>',lambda e:my_canvas.configure(scrollregion=my_canvas.bbox("all")))
-
-second_frame = tk.Frame(my_canvas)
+def _describe(error):
+    return str(error) or type(error).__name__
 
 
-# Configure grid in `second_frame` for vertical centering
-second_frame.grid_rowconfigure(0, weight=1)  # Top spacer
-second_frame.grid_rowconfigure(1, weight=0)  # Frame 1
-second_frame.grid_rowconfigure(2, weight=0)  # Frame 2
-second_frame.grid_rowconfigure(3, weight=0)  # Frame 3
-second_frame.grid_rowconfigure(4, weight=1)  # Bottom spacer
+class MilkFilterApp:
+    def __init__(self, window):
+        self.window = window
+        self.source = None  # the opened image
+        self.result = None  # the filtered image
+        self.job = 0  # number of the latest filter run, results of older runs are dropped
+        self.results = queue.Queue()  # filter results coming from the background thread
+        self.viewer = None
 
-second_frame.grid_columnconfigure(0, weight=1)  # Center column
+        window.title("Milk filter!")
+        screen_width = window.winfo_screenwidth()
+        screen_height = window.winfo_screenheight()
+        window.geometry(f"{screen_width}x{screen_height}")
+        # state zoomed doesnt work on x11 system
+        if os.name == "nt":
+            window.state("zoomed")
 
-my_canvas.create_window((0,0), window=second_frame,anchor="nw")
+        # A portrait screen (like a phone with Pydroid 3) gets short texts and the images under each other.
+        self.compact = screen_height > screen_width
+        if self.compact:
+            self.preview_size = (int(screen_width / 1.1), int(screen_height / 2.6))
+        else:
+            self.preview_size = (int(screen_width / 2.2), int(screen_height / 2.2))
+        self.viewer_size = (int(screen_width / 1.5), int(screen_height / 1.5))
 
-# Function to check if scrolling is active
-def is_scroll_active():
-    scroll_region = my_canvas.cget('scrollregion')
-    if not scroll_region:  # If no scrollregion is defined, scrolling is inactive
-        return False
-    x1, y1, x2, y2 = map(int, scroll_region.split())
-    canvas_height = my_canvas.winfo_height()
-    return (y2 - y1) > canvas_height  # Active if content height > canvas height
+        try:
+            self.icon = ImageTk.PhotoImage(file=resource_path("icon.ico"))
+            window.iconphoto(True, self.icon)
+        except (OSError, tk.TclError):  # the icon is optional, e.g. when only filter.py was downloaded
+            self.icon = None
 
-# Function to handle mouse wheel scrolling
-def _on_mouse_wheel(event):
-    if is_scroll_active():  # Only scroll if the scrollbar is active
-        my_canvas.yview_scroll(-1 * int((event.delta / 120)), "units")
+        self._build_scroll_area()
+        self._build_widgets()
+        self._check_results()
 
-my_canvas.bind_all("<MouseWheel>", _on_mouse_wheel)
+    def _build_scroll_area(self):
+        main_frame = tk.Frame(self.window)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(main_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=self.canvas.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
 
-frame_1 = ttk.Frame(second_frame)
-frame_2 = ttk.Frame(second_frame)
-frame_3 = ttk.Frame(second_frame)
+        self.content = tk.Frame(self.canvas)
+        self.content_window = self.canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.canvas.bind("<Configure>", self._update_scroll_area)
+        self.content.bind("<Configure>", self._update_scroll_area)
+        # The wheel is <MouseWheel> on Windows and macOS (and on X11 since Tk 8.7), <Button-4/5> on X11 before.
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.window.bind_all(sequence, self._on_mouse_wheel)
 
-# Configure columns for centering
-frame_2.grid_columnconfigure(0, weight=1)  # Left column
-frame_2.grid_columnconfigure(1, weight=1)  # Center column
-frame_2.grid_columnconfigure(2, weight=1)  # Right column
+    def _update_scroll_area(self, event=None):
+        """Stretch the content to the canvas width, center it when it fits and let it scroll when it doesn't."""
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        content_height = self.content.winfo_reqheight()
+        self.canvas.itemconfigure(self.content_window, width=width)
+        self.canvas.coords(self.content_window, 0, max(0, (height - content_height) // 2))
+        self.canvas.configure(scrollregion=(0, 0, width, max(height, content_height)))
 
+    def _on_mouse_wheel(self, event):
+        if event.num == 4:
+            units = -1
+        elif event.num == 5:
+            units = 1
+        elif abs(event.delta) >= 120:  # Windows and newer Tk: 120 per wheel step
+            units = int(-event.delta / 120)
+        elif event.delta:  # macOS and touchpads send smaller steps
+            units = -1 if event.delta > 0 else 1
+        else:
+            return
+        self.canvas.yview_scroll(units, "units")
 
-def showImgViewer(imgVw):
-    imgVw.show()
+    def _build_widgets(self):
+        top = ttk.Frame(self.content)
+        images = ttk.Frame(self.content)
+        self.options = ttk.Frame(self.content)  # shown once an image is opened
+        top.pack(pady=5)
+        images.pack(pady=5)
 
-def show_image(imagShow):
-    global imagShowD
-    # Create a new Toplevel window
-    viewer = tk.Toplevel()
-    viewer.title("Image Viewer")
-    viewer.iconphoto(False, iconPhoto)
+        ttk.Button(top, text="Open a File", command=self.select_file).pack()
 
-    canvasViewer = tk.Canvas(viewer)
-    canvasViewer.pack(fill=tk.BOTH,expand=1)
+        width, height = self.preview_size
+        self.placeholder = ImageTk.PhotoImage(Image.new("RGB", self.preview_size, (203, 203, 203)))
+        side = tk.TOP if self.compact else tk.LEFT
+        self.original_label = tk.Label(images, image=self.placeholder, width=width, height=height)
+        self.original_label.pack(side=side)
+        self.result_label = tk.Label(images, image=self.placeholder, width=width, height=height, compound="center")
+        self.result_label.pack(side=side)
 
-    imagShowD = imagShow.resize((int(widthWindow/1.5), int(heightWindow/1.5)), Image.Resampling.LANCZOS)
-    photo = ImageTk.PhotoImage(imagShowD)
-    label = tk.Label(canvasViewer, image=photo)
-    label.image = photo
-    label.pack(fill=tk.BOTH,expand=1)
+        self.compression = tk.IntVar(value=0)
+        self.compression_level = tk.IntVar(value=0)
+        self.pointillism = tk.IntVar(value=0)
+        self.milk = tk.IntVar(value=1)
+        if self.compact:
+            compression_text = "Compression?"
+            level_text = "Level of compression (0 best, 100 worst): "
+            pointillism_text = "Pointillism effect?"
+        else:
+            compression_text = "Check this box if you want compression on the image or not."
+            level_text = "Level of compression (from 0 best quality to 100 worst quality): "
+            pointillism_text = "Check this box if you want the pointillism effect on the image or not."
 
-    show_button = ttk.Button(canvasViewer,text='See file in image viewer',command=lambda:showImgViewer(imagShow))
+        tk.Checkbutton(self.options, text=compression_text, variable=self.compression,
+                       command=self._toggle_compression).grid(row=0)
+        self.level_label = tk.Label(self.options, text="0")
+        self.compression_widgets = [
+            tk.Label(self.options, text=level_text),
+            ttk.Scale(self.options, variable=self.compression_level, from_=0, to=100, command=self._on_level_change),
+            self.level_label,
+        ]
+        for row, widget in enumerate(self.compression_widgets, start=1):
+            widget.grid(row=row)
+            widget.grid_remove()
+        tk.Checkbutton(self.options, text=pointillism_text, variable=self.pointillism).grid(row=4)
+        tk.Radiobutton(self.options, text="Milk1 effect", variable=self.milk, value=1).grid(row=5)
+        tk.Radiobutton(self.options, text="Milk2 effect", variable=self.milk, value=2).grid(row=6)
+        self.apply_button = ttk.Button(self.options, text="Apply filter", command=self.apply_filter)
+        self.apply_button.grid(row=7)
+        self.progress = ttk.Progressbar(self.options, orient="horizontal", length=300, mode="indeterminate")
+        self.progress.grid(row=8, pady=5)
+        self.progress.grid_remove()
+        self.save_button = ttk.Button(self.options, text="Save image", command=self.save)
+        self.save_button.grid(row=9, pady=5)
+        self.save_button.grid_remove()
 
-    show_button.pack(expand=True)
+    def _toggle_compression(self):
+        for widget in self.compression_widgets:
+            if self.compression.get() == 1:
+                widget.grid()
+            else:
+                widget.grid_remove()
 
-    # Detect when the Toplevel window is closed
-    def on_close():
-        viewer.destroy()
+    def _on_level_change(self, value):
+        self.level_label.configure(text=str(int(float(value))))
 
-    viewer.protocol("WM_DELETE_WINDOW", on_close)
+    def _show(self, label, img, size=None):
+        photo = ImageTk.PhotoImage(fit(img, size or self.preview_size))
+        label.configure(image=photo, text="")
+        label.image = photo  # keep a reference, otherwise Tk shows nothing
 
+    def _clear_result(self, text=""):
+        self.result = None
+        self.result_label.configure(image=self.placeholder, text=text)
+        self.save_button.grid_remove()
 
-def save_image(imageSave):
-    fileSave = fd.asksaveasfile(defaultextension=".png",filetypes=[(".png",".png"),(".jpg",".jpg"),(".jpeg",".jpeg")])
-    if fileSave:
-        imageSave.save(fileSave.name)
+    def _set_busy(self, busy):
+        if busy:
+            self.apply_button.state(["disabled"])
+            self.progress.grid()
+            self.progress.start(10)
+        else:
+            self.progress.stop()
+            self.progress.grid_remove()
+            self.apply_button.state(["!disabled"])
 
-def apply_filter(filename):
-    global progress_bar
+    def select_file(self):
+        filetypes = [("Image files (.png,.jpg,.jpeg)", "*.png *.jpg *.jpeg")]
+        filename = fd.askopenfilename(title="Open a file", initialdir=".", filetypes=filetypes)
+        if not filename:
+            return
+        try:
+            with Image.open(filename) as img:
+                source = upright(img)
+        except Exception as error:  # not an image, no permission, ...
+            messagebox.showerror("Could not open the image", _describe(error))
+            return
 
-    # Create progress bar if not already made
-    if not hasattr(apply_filter, "progress_bar"):
-        progress_bar = ttk.Progressbar(frame_3, orient="horizontal", length=300, mode="determinate")
-        apply_filter.progress_bar = progress_bar
-    else:
-        progress_bar = apply_filter.progress_bar
+        self.source = source
+        self.job += 1  # a filter run for the previous image is not wanted anymore
+        self._set_busy(False)
+        self._show(self.original_label, source)
+        self._clear_result()
+        self.options.pack(pady=5)
 
-    progress_bar.pack(pady=5)
-    progress_bar["value"] = 0
-    progress_bar["maximum"] = 100
-
-    # Disable Apply button while processing
-    apply_button.config(state="disabled")
-    applied.config(text="Processing...", image="", compound="center")
-
-    def probably(chance):
-        return random.random() < chance
-
-    def process_image(update_progress):
-        punt = 70 if eff.get() == 1 else 100
-        milk_type = milk.get()
-
-        imag = Image.open(filename)
-        if imag.mode != 'RGB':
-            imag = imag.convert('RGB')
-
-        if comp.get() == 1:
-            buffer = io.BytesIO()
-            quality = max(1, 100 - slider_int.get())
-            imag.save(buffer, format='JPEG', quality=quality)
-            buffer.seek(0)
-            imag = Image.open(buffer).convert('RGB')
-
-        width, height = imag.size
-
-        color_map = {
-            1: [(0, 0, 0), (102, 0, 31), (137, 0, 146)],
-            2: [(0, 0, 0), (92, 36, 60), (203, 43, 43)]
+    def apply_filter(self):
+        settings = {
+            "milk_type": self.milk.get(),
+            "pointillism": self.pointillism.get() == 1,
+            "compression": self.compression_level.get() if self.compression.get() == 1 else 0,
         }
-        colors = color_map[milk_type]
-        pixels = imag.load()
+        self.job += 1
+        self._set_busy(True)
+        self._clear_result("Processing...")
+        # The thread gets plain values and its own copy of the image: Tk may only be used from this thread.
+        threading.Thread(target=self._run_filter, args=(self.job, self.source.copy(), settings), daemon=True).start()
 
-        thresh_mid1 = 120 if milk_type == 1 else 90
-        thresh_mid2 = 200 if milk_type == 1 else 150
+    def _run_filter(self, job, source, settings):
+        """Runs in a background thread, the result goes back through the queue."""
+        try:
+            self.results.put((job, apply_milk_filter(source, **settings), None))
+        except Exception as error:
+            self.results.put((job, None, error))
 
-        for y in range(height):
-            for x in range(width):
-                R, G, B = pixels[x, y]
-                brightness = (R + G + B) / 3
+    def _check_results(self):
+        """Pick up finished filter runs, every 100 ms on the Tk thread."""
+        try:
+            while True:
+                job, result, error = self.results.get_nowait()
+                if job == self.job:
+                    self._finish(result, error)
+        except queue.Empty:
+            pass
+        self.window.after(100, self._check_results)
 
-                if brightness <= 25:
-                    pixels[x, y] = colors[0]
-                elif brightness <= 70:
-                    pixels[x, y] = colors[0] if probably(punt / 100) else colors[1]
-                elif brightness < thresh_mid1:
-                    pixels[x, y] = colors[1] if probably(punt / 100) else colors[0]
-                elif brightness < thresh_mid2:
-                    pixels[x, y] = colors[1]
-                elif brightness < 230:
-                    pixels[x, y] = colors[2] if probably(punt / 100) else colors[1]
-                else:
-                    pixels[x, y] = colors[2]
+    def _finish(self, result, error):
+        self._set_busy(False)
+        if error is not None:
+            self._clear_result()
+            messagebox.showerror("Could not apply the filter", _describe(error))
+            return
+        self.result = result
+        self._show(self.result_label, result)
+        self.save_button.grid()
+        self._show_viewer(result)
 
-            # Update progress after each row
-            if y % max(1, height // 100) == 0:
-                update_progress((y / height) * 100)
+    def _show_viewer(self, result):
+        if self.viewer is None or not self.viewer.winfo_exists():
+            self.viewer = tk.Toplevel(self.window)
+            self.viewer.title("Image Viewer")
+            self.viewer_label = tk.Label(self.viewer)
+            self.viewer_label.pack(fill=tk.BOTH, expand=True)
+            self.viewer_button = ttk.Button(self.viewer, text="See file in image viewer")
+            self.viewer_button.pack(expand=True)
+        self._show(self.viewer_label, result, self.viewer_size)
+        self.viewer_button.configure(command=result.show)
+        self.viewer.deiconify()
+        self.viewer.lift()
 
-        update_progress(100)  # Ensure it ends at 100%
-        return imag
-
-    def on_done(imag):
-        progress_bar.pack_forget()
-
-        imagResize = imag.resize((int(widthWindow / 2.2), int(heightWindow / 2.2)), Image.Resampling.LANCZOS)
-        imgFilter = ImageTk.PhotoImage(imagResize)
-        applied.config(image=imgFilter, text="", compound=None)
-        applied.image = imgFilter
-
-        window.update_idletasks()
-        my_canvas.configure(scrollregion=my_canvas.bbox("all"))
-
-        global savedButton, save_button
-        if savedButton is False:
-            save_button = ttk.Button(frame_3, text='Save image', command=lambda: save_image(imag))
-            save_button.pack(expand=True, pady=5)
-            savedButton = True
-            window.update_idletasks()
-            my_canvas.configure(scrollregion=my_canvas.bbox("all"))
-        else:
-            save_button.config(command=lambda: save_image(imag))
-
-        show_image(imag)
-        apply_button.config(state="normal")
-
-    def worker():
-        def update_progress(val):
-            window.after(0, lambda: progress_bar.config(value=val))
-
-        imag = process_image(update_progress)
-        window.after(0, lambda: on_done(imag))
-
-    threading.Thread(target=worker, daemon=True).start()
+    def save(self):
+        filetypes = [(".png", ".png"), (".jpg", ".jpg"), (".jpeg", ".jpeg")]
+        filename = fd.asksaveasfilename(defaultextension=".png", filetypes=filetypes)
+        if not filename:
+            return
+        try:
+            save_image(self.result, filename)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Could not save the image", _describe(error))
 
 
-def on_value_change(value):
-    slider_number_label.configure(text=str(int(float(value))))
-
-def slider_display():
-    if(comp.get()==1):
-        slider_label.pack()
-        slider.pack()
-        slider_number_label.pack()
-        slider.configure(command=on_value_change)
-        window.update_idletasks()
-        my_canvas.configure(scrollregion=my_canvas.bbox("all"))
+def main():
+    if len(sys.argv) > 1:
+        run_cli(sys.argv[1:])
+    elif tk is None:
+        sys.exit("The GUI needs tkinter. Install it, or use the command line: python filter.py --help")
     else:
-        slider_label.pack_forget()
-        slider.pack_forget()
-        slider_number_label.pack_forget()
-        window.update_idletasks()
-        my_canvas.configure(scrollregion=my_canvas.bbox("all"))
-
-def select_file():
-    global button_created
-    global apply_button
-    filetypes = (
-                        ('Image files (.png,.jpg,.jpeg)', '*.png'),
-                        ('Image files (.png,.jpg,.jpeg)','*.jpg'),
-                        ('Image files (.png,.jpg,.jpeg)','*.jpeg')
-                )
-
-    filename = fd.askopenfilename(title='Open a file',initialdir='.',filetypes=filetypes)
-
-    if filename:
-        img = Image.open(filename)
-        resized_img = img.resize((int(widthWindow/2.2), int(heightWindow/2.2)), Image.Resampling.LANCZOS)
-        imgTk = ImageTk.PhotoImage(resized_img)
-        display.config(image=imgTk)
-        display.image = imgTk
-        window.update_idletasks()
-        my_canvas.configure(scrollregion=my_canvas.bbox("all"))
-        
-        if(button_created == False):     
-            compression = tk.Checkbutton(frame_3, text='Check this box if you want compression on the image or not.', variable = comp,onvalue=1,offvalue=0,command=slider_display)
-            compression.pack()
-            effect = tk.Checkbutton(frame_3, text='Check this box if you want the pointillism effect on the image or not.', variable = eff,onvalue=1,offvalue=0)
-            effect.pack()
-            R1 = tk.Radiobutton(frame_3, text="Milk1 effect", variable=milk, value=1)
-            R1.pack()
-            R1.select()
-            R2 = tk.Radiobutton(frame_3, text="Milk2 effect", variable=milk, value=2)
-            R2.pack()
-
-            apply_button = ttk.Button(frame_3,text='Apply filter',command=lambda: apply_filter(filename))
-            apply_button.pack(expand=True)
-            window.update_idletasks()
-            my_canvas.configure(scrollregion=my_canvas.bbox("all"))
-            button_created = True
-        else:
-            apply_button.config(command=lambda: apply_filter(filename))
+        window = tk.Tk()
+        MilkFilterApp(window)
+        window.mainloop()
 
 
-open_button = ttk.Button(frame_1,text='Open a File',command=select_file)
-
-open_button.pack(expand=True)
-
-button_created = False
-savedButton = False
-
-# apply_button = ttk.Button(frame_3,text='Apply test',command=lambda: apply_filter(filename))
-# save_button = ttk.Button(frame_3,text='Save image',command=lambda: save_image(imag))
-
-slider_label = tk.Label(frame_3,text="Level of compression (from 0 best quality to 100 worst quality): ")
-slider_label.pack()
-slider_label.pack_forget()
-
-slider_int = tk.IntVar(value = 0)
-slider = ttk.Scale(frame_3, variable = slider_int,from_=0,to=100)
-slider.pack()
-slider.pack_forget()
-
-slider_number_label = tk.Label(frame_3,text="0")
-slider_number_label.pack()
-slider_number_label.pack_forget()
-
-comp = tk.IntVar()
-eff = tk.IntVar()
-
-milk = tk.IntVar()
-
-rect = Image.new(mode='RGB', size=(int(widthWindow/2.2), int(heightWindow/2.2)),color=(203, 203, 203))
-rectTk = ImageTk.PhotoImage(rect)
-
-display = tk.Label(frame_2)
-display.pack(side = tk.LEFT)
-
-display.config(image=rectTk)
-display.image = rectTk
-
-applied = tk.Label(frame_2)
-applied.pack(side = tk.LEFT)
-applied.config(image=rectTk)
-applied.image = rectTk
-
-window.update_idletasks()
-my_canvas.configure(scrollregion=my_canvas.bbox("all"))
-
-
-frame_1.grid(row=1,column=0, pady=5)
-frame_2.grid(row=2,column=0, pady=5)
-frame_3.grid(row=3,column=0, pady=5)
-
-second_frame.pack(fill=tk.BOTH,expand=1)
-
-
-window.mainloop()
+if __name__ == "__main__":
+    main()
